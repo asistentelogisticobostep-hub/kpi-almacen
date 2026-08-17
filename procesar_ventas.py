@@ -215,9 +215,9 @@ def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
             lambda x: pd.NA if pd.isna(x) else ("Cumple" if x <= OBJETIVO_SLA_INTERNO_MIN else "No cumple")
         )
 
-        p90_interno = df["Tiempo_Interno_Total_min"].quantile(0.90)
+        p95_interno = df["Tiempo_Interno_Total_min"].quantile(0.95)
         df["Pico_Tiempo_Interno"] = df["Tiempo_Interno_Total_min"].apply(
-            lambda x: pd.NA if pd.isna(x) else ("Sí" if x > p90_interno else "No")
+            lambda x: pd.NA if pd.isna(x) else ("Sí" if x > p95_interno else "No")
         )
 
     if "Tiempo_Total_min" in df.columns:
@@ -229,9 +229,9 @@ def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
             lambda x: pd.NA if pd.isna(x) else ("Cumple" if x <= OBJETIVO_SLA_INTERNO_MIN else "No cumple")
         )
 
-        p90_total = df["Tiempo_Total_min"].quantile(0.90)
+        p95_total = df["Tiempo_Total_min"].quantile(0.90)
         df["Pico_Tiempo_Total"] = df["Tiempo_Total_min"].apply(
-            lambda x: pd.NA if pd.isna(x) else ("Sí" if x > p90_total else "No")
+            lambda x: pd.NA if pd.isna(x) else ("Sí" if x > p95_total else "No")
         )
 
     return df
