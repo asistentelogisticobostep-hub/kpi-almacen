@@ -6,11 +6,41 @@
 VERSIÓN: Preparada para correr automáticamente en GitHub Actions
 (lee credenciales e IDs de hoja desde variables de entorno / Secrets,
 no desde archivos ni valores escritos en el código)
+
+CAMBIOS EN ESTA VERSIÓN (acordados en revisión de datos):
+  - Validación de columnas requeridas al inicio (advertencia si faltan).
+  - Verificación de DataFrame vacío antes de procesar.
+  - Subida a Google Sheets por lotes de 1000 filas.
+  - Pico_Tiempo_Total ahora usa percentil 0.95 (antes 0.90), igual que Pico_Tiempo_Interno.
+  - Logging en vez de print.
+  - Reintentos ligeros SOLO en la descarga del CSV (no en la subida).
+  - Tiempo_Interno_Total_min (y derivados) ya NO se calcula como Fin.Pack - Hora Reg. directo
+    con tope de 1 día. Ahora tiene 3 ramas:
+      1) Si los 6 tramos (Picking, Checking, Packing, Espera_Reg_Pick, Espera_Pick_Check,
+         Espera_Check_Pack) están completos -> suma real de los 6 (medida más precisa,
+         inmune al bug de medianoche porque cada tramo ya se corrige en el punto de
+         digitación con el formato condicional de la hoja fuente).
+      2) Si no, pero Fin. Pack sí tiene dato (por ejemplo, pedidos antiguos cerrados
+         manualmente al redondear a la hora de cierre de turno) -> Fin. Pack - Hora Reg.
+         directo.
+      3) Si el pedido sigue abierto -> tiempo transcurrido = ahora (momento de ejecución
+         del script) - Hora Reg. Nunca queda en 0 ni en blanco mientras está en proceso.
+  - Cumple_SLA_Interno pasa de 2 a 3 estados: 'Cumple' / 'No cumple' / 'En proceso'.
+  - Pico_Tiempo_Interno y Pico_Tiempo_Total se calculan SOLO sobre pedidos cerrados
+    (Cumple/No cumple), para que los pedidos "En proceso" (incluidos los antiguos
+    abandonados) no distorsionen el percentil.
+  - NO se cambia el parseo de fechas (se mantiene formato fijo %d/%m/%Y).
+  - NO se vectoriza el código por ahora.
+  - NO se toca la lógica de time_diff_datetime para los 6 tramos individuales: el bug de
+    medianoche en esos tramos se corrige en la fuente (alerta visual al digitador), no
+    en el script.
 """
 
 import json
+import logging
 import os
 import re
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -21,9 +51,16 @@ from google.oauth2.service_account import Credentials
 
 CARPETA_SCRIPT = Path(__file__).resolve().parent
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("procesar_ventas")
+
 
 # =====================================================================
-# 1. CONFIGURACIÓN — ahora se lee desde variables de entorno (Secrets)
+# 1. CONFIGURACIÓN — se lee desde variables de entorno (Secrets)
 # =====================================================================
 
 SHEET_ID_ORIGINAL = os.environ["SHEET_ID_ORIGINAL"]
@@ -40,27 +77,78 @@ COLUMNAS_HORA = [
     "Ini. Check", "Fin. Check", "Ini. Pack", "Fin. Pack", "Hora envio",
 ]
 
+# Columnas mínimas que el pipeline necesita para calcular los KPIs.
+# Si falta alguna, se sigue procesando pero se avisa con una advertencia
+# (no se detiene el script: preferimos un reporte incompleto a uno que no corre).
+COLUMNAS_REQUERIDAS = [
+    "FECHA", "ESTATUS DEL PEDIDO", "Hora Reg.",
+    "Ini. Pick", "Fin. Pick", "Ini. Check", "Fin. Check",
+    "Ini. Pack", "Fin. Pack", "Hora envio", "FECHA DE ENVIO",
+]
+
 DIAS_ES = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves",
            4: "Viernes", 5: "Sábado", 6: "Domingo"}
 
 OBJETIVO_SLA_INTERNO_MIN = 90
 
+# Estatus de origen (columna "ESTATUS DEL PEDIDO") que consideramos "en proceso",
+# usados solo como referencia informativa en logs; el cálculo real de "cerrado" se
+# basa en si hay datos suficientes, no en el texto de este campo.
+ESTATUS_EN_PROCESO = {
+    "PEDIDO SIN ASIGNAR", "CHECKING EN PROCESO",
+    "PICKING EN PROCESO", "PACKING EN PROCESO", "PACKING PENDIENTE",
+}
+
+MAX_REINTENTOS_DESCARGA = 3
+ESPERA_ENTRE_REINTENTOS_SEG = 5
+TAMANO_LOTE_SUBIDA = 1000
+
 
 # =====================================================================
-# 2. LECTURA DE LA HOJA ORIGINAL (vía CSV público)
+# 2. LECTURA DE LA HOJA ORIGINAL (vía CSV público, con reintentos ligeros)
 # =====================================================================
 def leer_google_sheets_csv(sheet_id: str, gid: str) -> pd.DataFrame:
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    print("Descargando datos de la hoja ORIGINAL...")
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text), low_memory=False, dayfirst=True)
-    print(f"Hoja original leída: {len(df)} filas, {len(df.columns)} columnas.")
-    return df
+
+    ultimo_error = None
+    for intento in range(1, MAX_REINTENTOS_DESCARGA + 1):
+        try:
+            log.info("Descargando datos de la hoja ORIGINAL (intento %d/%d)...",
+                      intento, MAX_REINTENTOS_DESCARGA)
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            df = pd.read_csv(StringIO(resp.text), low_memory=False, dayfirst=True)
+            log.info("Hoja original leída: %d filas, %d columnas.", len(df), len(df.columns))
+            return df
+        except (requests.exceptions.RequestException, pd.errors.ParserError) as exc:
+            ultimo_error = exc
+            log.warning("Fallo al descargar/parsear el CSV (intento %d/%d): %s",
+                        intento, MAX_REINTENTOS_DESCARGA, exc)
+            if intento < MAX_REINTENTOS_DESCARGA:
+                time.sleep(ESPERA_ENTRE_REINTENTOS_SEG)
+
+    log.error("No se pudo descargar la hoja original tras %d intentos.", MAX_REINTENTOS_DESCARGA)
+    raise SystemExit(1) from ultimo_error
 
 
 # =====================================================================
-# 3. LIMPIEZA DE HORAS CORRUPTAS
+# 3. VALIDACIÓN DE COLUMNAS Y DE DATAFRAME VACÍO
+# =====================================================================
+def validar_columnas(df: pd.DataFrame) -> None:
+    faltantes = [c for c in COLUMNAS_REQUERIDAS if c not in df.columns]
+    if faltantes:
+        log.warning("Faltan columnas esperadas en la hoja origen: %s. "
+                    "Algunos KPIs relacionados no se podrán calcular.", faltantes)
+
+
+def verificar_no_vacio(df: pd.DataFrame) -> None:
+    if df.empty:
+        log.error("La hoja origen no devolvió filas. Abortando para no subir un reporte vacío.")
+        raise SystemExit(1)
+
+
+# =====================================================================
+# 4. LIMPIEZA DE HORAS CORRUPTAS
 # =====================================================================
 PATRON_HORA = re.compile(
     r"(\d{1,2}):(\d{2})(?::(\d{2}))?(?:[.,]\d+)?\s*(a\.?m\.?|p\.?m\.?)?\s*$",
@@ -102,7 +190,9 @@ def clean_time(valor):
 
 
 # =====================================================================
-# 4. CÁLCULO DE DIFERENCIAS DE TIEMPO (KPIs) CON SOPORTE MULTIDÍA
+# 5. CÁLCULO DE DIFERENCIAS DE TIEMPO (KPIs) CON SOPORTE MULTIDÍA
+#    (sin cambios: el bug de medianoche en estos 6 tramos se corrige en la
+#     fuente, no aquí — ver nota al inicio del archivo)
 # =====================================================================
 def time_diff_datetime(df, col_fecha_ini, col_hora_ini, col_fecha_fin=None, col_hora_fin=None):
     def calcular(fila):
@@ -145,10 +235,34 @@ def time_diff_datetime(df, col_fecha_ini, col_hora_ini, col_fecha_fin=None, col_
     return df.apply(calcular, axis=1)
 
 
+def minutos_desde_hasta_ahora(df, col_fecha, col_hora, ahora: pd.Timestamp):
+    """Minutos transcurridos entre (FECHA + col_hora) y 'ahora'. NA si no hay hora inicial."""
+    def calcular(fila):
+        f_ini = fila[col_fecha] if col_fecha in fila.index else pd.NA
+        h_ini = fila[col_hora] if col_hora in fila.index else pd.NA
+        if pd.isna(h_ini):
+            return pd.NA
+        str_f_ini = str(f_ini).strip() if pd.notna(f_ini) else None
+        str_h_ini = str(h_ini).strip()
+        try:
+            if str_f_ini:
+                dt_ini = pd.to_datetime(f"{str_f_ini} {str_h_ini}", errors="coerce")
+            else:
+                dt_ini = pd.to_datetime(str_h_ini, format="%H:%M:%S", errors="coerce")
+            if pd.isna(dt_ini):
+                return pd.NA
+            diferencia = (ahora - dt_ini).total_seconds() / 60
+            return round(diferencia, 2) if diferencia >= 0 else pd.NA
+        except Exception:
+            return pd.NA
+
+    return df.apply(calcular, axis=1)
+
+
 # =====================================================================
-# 5. COLUMNAS AUXILIARES Y BANDERAS
+# 6. COLUMNAS AUXILIARES Y BANDERAS
 # =====================================================================
-def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
+def agregar_columnas_auxiliares(df: pd.DataFrame, ahora: pd.Timestamp) -> pd.DataFrame:
     if "FECHA" in df.columns:
         df["FECHA_DT"] = pd.to_datetime(df["FECHA"], errors="coerce")
         df["Dia_Semana"] = df["FECHA_DT"].dt.dayofweek.map(DIAS_ES)
@@ -187,6 +301,7 @@ def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
 
         df["Cerrado_Mismo_Dia"] = df.apply(eval_cierre_mismo_dia, axis=1)
 
+    # --- Tramos de proceso y espera (sin cambios en su definición) ---
     columnas_proceso = ['Tiempo_Picking_min', 'Tiempo_Checking_min', 'Tiempo_Packing_min']
     if all(col in df.columns for col in columnas_proceso):
         df['Tiempo_Proceso_Total_min'] = df[columnas_proceso].sum(axis=1, min_count=1)
@@ -201,25 +316,73 @@ def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
             df[columnas_espera].notna().any(axis=1), pd.NA
         )
 
-    if {"Hora Reg.", "Fin. Pack"}.issubset(df.columns):
-        df["Tiempo_Interno_Total_min"] = time_diff_datetime(
-            df, "FECHA", "Hora Reg.", None, "Fin. Pack"
-        )
+    # =================================================================
+    # Tiempo_Interno_Total_min: 3 ramas (ver notas al inicio del archivo)
+    # =================================================================
+    columnas_los_6_tramos = columnas_proceso + columnas_espera
+    tiene_6_tramos = all(col in df.columns for col in columnas_los_6_tramos)
+    tiene_fin_pack = "Fin. Pack" in df.columns
+    tiene_hora_reg = "Hora Reg." in df.columns
+
+    if tiene_hora_reg and (tiene_6_tramos or tiene_fin_pack):
+        n = len(df)
+        tiempo_interno = pd.Series([pd.NA] * n, index=df.index, dtype="object")
+        estado_pedido = pd.Series(["En proceso"] * n, index=df.index, dtype="object")
+
+        # Rama 1: los 6 tramos completos -> suma real (más precisa)
+        if tiene_6_tramos:
+            todos_presentes = df[columnas_los_6_tramos].notna().all(axis=1)
+            suma_tramos = df[columnas_los_6_tramos].sum(axis=1, min_count=len(columnas_los_6_tramos))
+            tiempo_interno = tiempo_interno.where(~todos_presentes, suma_tramos)
+            estado_pedido = estado_pedido.where(~todos_presentes, "Cerrado")
+        else:
+            todos_presentes = pd.Series([False] * n, index=df.index)
+
+        # Rama 2: sin los 6 tramos, pero Fin. Pack sí tiene dato -> Fin.Pack - Hora Reg. directo
+        # (cubre, por ejemplo, pedidos antiguos cerrados manualmente al redondear al cierre de turno)
+        if tiene_fin_pack:
+            fin_pack_directo = time_diff_datetime(df, "FECHA", "Hora Reg.", None, "Fin. Pack")
+            usar_rama_2 = (~todos_presentes) & df["Fin. Pack"].notna() & fin_pack_directo.notna()
+            tiempo_interno = tiempo_interno.where(~usar_rama_2, fin_pack_directo)
+            estado_pedido = estado_pedido.where(~usar_rama_2, "Cerrado")
+        else:
+            usar_rama_2 = pd.Series([False] * n, index=df.index)
+
+        # Rama 3: pedido sigue abierto -> tiempo transcurrido hasta el momento de ejecución
+        aun_abierto = ~(todos_presentes | usar_rama_2)
+        transcurrido = minutos_desde_hasta_ahora(df, "FECHA", "Hora Reg.", ahora)
+        tiempo_interno = tiempo_interno.where(~aun_abierto, transcurrido)
+        # estado_pedido ya queda en "En proceso" por defecto para esta rama
+
+        df["Tiempo_Interno_Total_min"] = pd.to_numeric(tiempo_interno, errors="coerce")
+        df["Pedido_Cerrado"] = estado_pedido  # "Cerrado" / "En proceso" — útil para filtrar promedios en Looker
 
     if "Tiempo_Interno_Total_min" in df.columns:
         tiempo_interno_num = pd.to_numeric(df["Tiempo_Interno_Total_min"], errors='coerce')
         df["Tiempo_Interno_Horas"] = (tiempo_interno_num / 60).round(2)
         df["Tiempo_Interno_Dias"] = (tiempo_interno_num / 1440).round(2)
 
-        df["Cumple_SLA_Interno"] = df["Tiempo_Interno_Total_min"].apply(
-            lambda x: pd.NA if pd.isna(x) else ("Cumple" if x <= OBJETIVO_SLA_INTERNO_MIN else "No cumple")
-        )
+        cerrado = df.get("Pedido_Cerrado", pd.Series(["Cerrado"] * len(df), index=df.index)) == "Cerrado"
 
-        p95_interno = df["Tiempo_Interno_Total_min"].quantile(0.95)
-        df["Pico_Tiempo_Interno"] = df["Tiempo_Interno_Total_min"].apply(
-            lambda x: pd.NA if pd.isna(x) else ("Sí" if x > p95_interno else "No")
-        )
+        def clasificar_sla(en_cierre, valor):
+            if not en_cierre or pd.isna(valor):
+                return "En proceso"
+            return "Cumple" if valor <= OBJETIVO_SLA_INTERNO_MIN else "No cumple"
 
+        df["Cumple_SLA_Interno"] = [
+            clasificar_sla(c, v) for c, v in zip(cerrado, tiempo_interno_num)
+        ]
+
+        # Percentil "pico" calculado SOLO sobre pedidos cerrados, para que los pedidos
+        # "En proceso" (incluidos los antiguos abandonados con tiempos enormes) no lo distorsionen.
+        valores_cerrados = tiempo_interno_num.where(cerrado)
+        p95_interno = valores_cerrados.quantile(0.95)
+        df["Pico_Tiempo_Interno"] = [
+            "No" if (not c or pd.isna(v)) else ("Sí" if v > p95_interno else "No")
+            for c, v in zip(cerrado, tiempo_interno_num)
+        ]
+
+    # --- KPI heredado (Tiempo_Total_min, de punta a punta hasta el envío) ---
     if "Tiempo_Total_min" in df.columns:
         total_min_num = pd.to_numeric(df["Tiempo_Total_min"], errors='coerce')
         df["Tiempo_Total_Horas"] = (total_min_num / 60).round(2)
@@ -229,7 +392,8 @@ def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
             lambda x: pd.NA if pd.isna(x) else ("Cumple" if x <= OBJETIVO_SLA_INTERNO_MIN else "No cumple")
         )
 
-        p95_total = df["Tiempo_Total_min"].quantile(0.90)
+        # Percentil corregido de 0.90 a 0.95 (antes usaba p90 pese a llamarse p95_total)
+        p95_total = total_min_num.quantile(0.95)
         df["Pico_Tiempo_Total"] = df["Tiempo_Total_min"].apply(
             lambda x: pd.NA if pd.isna(x) else ("Sí" if x > p95_total else "No")
         )
@@ -238,7 +402,7 @@ def agregar_columnas_auxiliares(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =====================================================================
-# 6. SUBIDA A GOOGLE SHEETS (credenciales desde variable de entorno)
+# 7. SUBIDA A GOOGLE SHEETS (credenciales desde variable de entorno, por lotes)
 # =====================================================================
 def subir_a_google_sheets(df: pd.DataFrame) -> None:
     scopes = [
@@ -249,12 +413,12 @@ def subir_a_google_sheets(df: pd.DataFrame) -> None:
     creds = Credentials.from_service_account_info(info_credenciales, scopes=scopes)
     client = gspread.authorize(creds)
 
-    print("Conectando a la hoja DESTINO...")
+    log.info("Conectando a la hoja DESTINO...")
     try:
         spreadsheet = client.open_by_key(SHEET_ID_DESTINO)
     except gspread.exceptions.SpreadsheetNotFound:
-        print("No pude abrir la hoja DESTINO. Revisa el SHEET_ID_DESTINO y que la hoja")
-        print(f"esté compartida con: {creds.service_account_email}")
+        log.error("No pude abrir la hoja DESTINO. Revisa el SHEET_ID_DESTINO y que la hoja "
+                   "esté compartida con: %s", creds.service_account_email)
         raise SystemExit(1)
 
     try:
@@ -262,7 +426,7 @@ def subir_a_google_sheets(df: pd.DataFrame) -> None:
     except gspread.exceptions.WorksheetNotFound:
         hoja = spreadsheet.add_worksheet(title=NOMBRE_PESTAÑA_DESTINO, rows=1, cols=1)
 
-    print("Limpiando datos de la hoja destino...")
+    log.info("Limpiando datos de la hoja destino...")
     hoja.clear()
 
     df_subida = df.copy()
@@ -276,30 +440,46 @@ def subir_a_google_sheets(df: pd.DataFrame) -> None:
             lambda x: str(x) if pd.notna(x) else ""
         )
 
-    datos = [df_subida.columns.tolist()] + df_subida.values.tolist()
+    encabezados = df_subida.columns.tolist()
+    filas = df_subida.values.tolist()
 
-    print(f"Subiendo {len(datos)-1} filas a Google Sheets...")
-    hoja.update(values=datos, range_name="A1", value_input_option="USER_ENTERED")
-    print("Datos subidos correctamente.")
+    log.info("Subiendo encabezado y %d filas en lotes de %d...", len(filas), TAMANO_LOTE_SUBIDA)
+
+    # Encabezado primero
+    hoja.update(values=[encabezados], range_name="A1", value_input_option="USER_ENTERED")
+
+    fila_inicio = 2  # la fila 1 ya tiene el encabezado
+    for i in range(0, len(filas), TAMANO_LOTE_SUBIDA):
+        lote = filas[i:i + TAMANO_LOTE_SUBIDA]
+        rango = f"A{fila_inicio}"
+        hoja.update(values=lote, range_name=rango, value_input_option="USER_ENTERED")
+        log.info("Lote subido: filas %d a %d.", fila_inicio, fila_inicio + len(lote) - 1)
+        fila_inicio += len(lote)
+
+    log.info("Datos subidos correctamente.")
 
 
 # =====================================================================
-# 7. FLUJO PRINCIPAL
+# 8. FLUJO PRINCIPAL
 # =====================================================================
 def main():
+    ahora = pd.Timestamp.now()
+
     df = leer_google_sheets_csv(SHEET_ID_ORIGINAL, GID_ORIGINAL)
+    verificar_no_vacio(df)
+    validar_columnas(df)
 
     if "FECHA" in df.columns:
         df["FECHA"] = pd.to_datetime(df["FECHA"], format="%d/%m/%Y", errors="coerce").dt.strftime("%Y-%m-%d")
     if "FECHA DE ENVIO" in df.columns:
         df["FECHA DE ENVIO"] = pd.to_datetime(df["FECHA DE ENVIO"], format="%d/%m/%Y", errors="coerce").dt.strftime("%Y-%m-%d")
 
-    print("Limpiando columnas de hora...")
+    log.info("Limpiando columnas de hora...")
     for col in COLUMNAS_HORA:
         if col in df.columns:
             df[col] = df[col].apply(clean_time)
 
-    print("Calculando KPIs Internos...")
+    log.info("Calculando KPIs internos...")
 
     if {"Ini. Pick", "Fin. Pick"}.issubset(df.columns):
         df["Tiempo_Picking_min"] = time_diff_datetime(df, "FECHA", "Ini. Pick", None, "Fin. Pick")
@@ -322,11 +502,11 @@ def main():
     if {"Hora Reg.", "Hora envio"}.issubset(df.columns):
         df["Tiempo_Total_min"] = time_diff_datetime(df, "FECHA", "Hora Reg.", "FECHA DE ENVIO", "Hora envio")
 
-    df = agregar_columnas_auxiliares(df)
+    df = agregar_columnas_auxiliares(df, ahora)
 
     subir_a_google_sheets(df)
 
-    print("Proceso completado.")
+    log.info("Proceso completado.")
 
 
 if __name__ == "__main__":
