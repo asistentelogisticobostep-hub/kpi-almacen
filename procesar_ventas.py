@@ -43,7 +43,7 @@ COLUMNAS_HORA = [
 DIAS_ES = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves",
            4: "Viernes", 5: "Sábado", 6: "Domingo"}
 
-OBJETIVO_SLA_INTERNO_MIN = 45
+OBJETIVO_SLA_INTERNO_MIN = 90
 
 
 # =====================================================================
