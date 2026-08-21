@@ -395,21 +395,17 @@ def agregar_columnas_auxiliares(df: pd.DataFrame, ahora: pd.Timestamp) -> pd.Dat
         df["Tiempo_Interno_Horas"] = (tiempo_interno_num / 60).round(2)
         df["Tiempo_Interno_Dias"] = (tiempo_interno_num / 1440).round(2)
 
-        estado = df.get("Pedido_Cerrado", pd.Series(["Cerrado"] * len(df), index=df.index))
-
-        def clasificar_sla(estado_fila, valor):
-            if pd.isna(estado_fila):
-                return pd.NA  # sin Hora Reg. (fila de relleno): no hay base para evaluar nada
-            if estado_fila == "En proceso":
-                return "En proceso"
-            # Cerrado: si no hay valor calculable (ej. PROC. RMS sin timestamps), no se juzga el SLA
+        # Cumple_SLA_Interno ya no distingue Cerrado/En proceso: es un umbral puro sobre el
+        # valor. Un pedido en proceso que ya lleva 91 min es "No cumple" igual que uno cerrado
+        # con 91 min — así no hace falta un filtro extra en el informe para dejar de contar el
+        # "En proceso" como una categoría aparte. Sin valor calculable (filas de relleno, o
+        # PROC. RMS sin timestamps) sigue en blanco, porque no hay nada que comparar.
+        def clasificar_sla(valor):
             if pd.isna(valor):
                 return pd.NA
             return "Cumple" if valor <= OBJETIVO_SLA_INTERNO_MIN else "No cumple"
 
-        df["Cumple_SLA_Interno"] = [
-            clasificar_sla(e, v) for e, v in zip(estado, tiempo_interno_num)
-        ]
+        df["Cumple_SLA_Interno"] = tiempo_interno_num.apply(clasificar_sla)
 
         # El umbral del percentil "pico" se calcula sobre el general de pedidos con tiempo
         # calculable (cerrados + en proceso), no solo cerrados. Con la clasificación actual
