@@ -161,12 +161,15 @@ def verificar_no_vacio(df: pd.DataFrame) -> None:
         raise SystemExit(1)
 
 
-def rellenar_columnas_texto_vacias(df: pd.DataFrame) -> pd.DataFrame:
+def rellenar_columnas_texto_vacias(df: pd.DataFrame, fila_es_pedido_real: pd.Series) -> pd.DataFrame:
     for columna, texto_defecto in COLUMNAS_TEXTO_SIN_DATO.items():
         if columna in df.columns:
             # .strip() == "" cubre tanto NaN como celdas con solo espacios en blanco.
+            # Solo se rellena si además la fila es un pedido real (VENDEDOR presente):
+            # una fila de relleno del sistema (sin vendedor, sin pedido) no es "un pedido
+            # sin observaciones", es una fila vacía y debe quedar vacía.
             vacio = df[columna].isna() | (df[columna].astype(str).str.strip() == "")
-            df.loc[vacio, columna] = texto_defecto
+            df.loc[vacio & fila_es_pedido_real, columna] = texto_defecto
         else:
             log.warning("Columna '%s' no encontrada; no se pudo rellenar su vacío.", columna)
     return df
@@ -287,12 +290,27 @@ def minutos_desde_hasta_ahora(df, col_fecha, col_hora, ahora: pd.Timestamp):
 # =====================================================================
 # 6. COLUMNAS AUXILIARES Y BANDERAS
 # =====================================================================
+def es_pedido_real(df: pd.DataFrame) -> pd.Series:
+    """True solo si VENDEDOR tiene contenido real. Es el criterio para distinguir un
+    pedido de verdad de una fila de relleno/reservada que el sistema deja vacía (puede
+    traer FECHA u otros campos sueltos, pero no es un pedido)."""
+    if "VENDEDOR" not in df.columns:
+        return pd.Series([True] * len(df), index=df.index)  # sin la columna, no filtramos nada
+    return df["VENDEDOR"].notna() & (df["VENDEDOR"].astype(str).str.strip() != "")
+
+
 def agregar_columnas_auxiliares(df: pd.DataFrame, ahora: pd.Timestamp) -> pd.DataFrame:
+    fila_real = es_pedido_real(df)
+
     if "FECHA" in df.columns:
         df["FECHA_DT"] = pd.to_datetime(df["FECHA"], errors="coerce")
         df["Dia_Semana"] = df["FECHA_DT"].dt.dayofweek.map(DIAS_ES)
         df["Semana_Anio"] = df["FECHA_DT"].dt.isocalendar().week.astype("Int64")
         df["Mes"] = df["FECHA_DT"].dt.month
+        # Filas de relleno (sin VENDEDOR) pueden traer una FECHA suelta, pero no son un
+        # pedido real: no tiene sentido decir de qué día de la semana o mes fue "el pedido".
+        for col in ["FECHA_DT", "Dia_Semana", "Semana_Anio", "Mes"]:
+            df.loc[~fila_real, col] = pd.NA
 
     if "Hora Reg." in df.columns:
         def hora_bucket(valor):
@@ -565,7 +583,7 @@ def main():
         df["Tiempo_Total_min"] = time_diff_datetime(df, "FECHA", "Hora Reg.", "FECHA DE ENVIO", "Hora envio")
 
     df = agregar_columnas_auxiliares(df, ahora)
-    df = rellenar_columnas_texto_vacias(df)
+    df = rellenar_columnas_texto_vacias(df, es_pedido_real(df))
 
     subir_a_google_sheets(df)
 
