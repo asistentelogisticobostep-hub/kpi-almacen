@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import time
+from datetime import timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -102,6 +103,11 @@ ESTATUS_EN_PROCESO = {
 MAX_REINTENTOS_DESCARGA = 3
 ESPERA_ENTRE_REINTENTOS_SEG = 5
 TAMANO_LOTE_SUBIDA = 1000
+
+# Perú no usa horario de verano, así que un offset fijo UTC-5 es exacto y, a diferencia de
+# usar tz="America/Lima", no depende de que el runner de GitHub Actions tenga la base de
+# datos tzdata instalada.
+ZONA_PERU = timezone(timedelta(hours=-5))
 
 
 # =====================================================================
@@ -405,13 +411,13 @@ def agregar_columnas_auxiliares(df: pd.DataFrame, ahora: pd.Timestamp) -> pd.Dat
             clasificar_sla(e, v) for e, v in zip(estado, tiempo_interno_num)
         ]
 
-        # El umbral del percentil "pico" se calcula SOLO sobre pedidos cerrados, para que los
-        # pedidos "En proceso" (incluidos los antiguos abandonados con tiempos enormes) no lo
-        # distorsionen. Pero el resultado (Sí/No) se aplica a CUALQUIER pedido con tiempo
-        # calculable, esté cerrado o no — un pedido abierto que ya lleva un tiempo anómalo
-        # también debe saltar como "pico" para que se pueda revisar a tiempo.
-        valores_cerrados = tiempo_interno_num.where(estado == "Cerrado")
-        p95_interno = valores_cerrados.quantile(0.95)
+        # El umbral del percentil "pico" se calcula sobre el general de pedidos con tiempo
+        # calculable (cerrados + en proceso), no solo cerrados. Con la clasificación actual
+        # (PROC. RMS siempre Cerrado, filas de relleno excluidas) el grupo "En proceso" ya es
+        # chico y no distorsiona el percentil de forma relevante — se validó contra datos
+        # reales: el umbral prácticamente no cambia entre calcularlo solo con cerrados o con
+        # el general (1536.0 vs 1536.05 en la última corrida).
+        p95_interno = tiempo_interno_num.dropna().quantile(0.95)
 
         def clasificar_pico(valor):
             if pd.isna(valor):
@@ -501,7 +507,10 @@ def subir_a_google_sheets(df: pd.DataFrame) -> None:
 # 8. FLUJO PRINCIPAL
 # =====================================================================
 def main():
-    ahora = pd.Timestamp.now()
+    # Ojo: GitHub Actions corre en UTC, pero Hora Reg. está en hora de Perú (UTC-5, sin
+    # horario de verano). Si no se ajusta, "ahora" queda ~5h adelantado y el tiempo
+    # transcurrido de los pedidos en proceso sale inflado en ~300 minutos.
+    ahora = pd.Timestamp.now(tz=ZONA_PERU).tz_localize(None)
 
     df = leer_google_sheets_csv(SHEET_ID_ORIGINAL, GID_ORIGINAL)
     verificar_no_vacio(df)
