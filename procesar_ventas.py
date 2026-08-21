@@ -104,13 +104,12 @@ MAX_REINTENTOS_DESCARGA = 3
 ESPERA_ENTRE_REINTENTOS_SEG = 5
 TAMANO_LOTE_SUBIDA = 1000
 
-# Columnas de texto donde un vacío significa "no hay nada que reportar", no "dato
-# faltante" — se rellenan con un valor legible para que no dependa de un truco en Looker
-# (que además no es seleccionable como filtro cuando queda en blanco). Fácil de ampliar:
-# solo hay que agregar la columna y el texto que debe mostrar cuando está vacía.
-COLUMNAS_TEXTO_SIN_DATO = {
-    "OBSERVACIONES": "Sin observaciones",
-}
+# NOTA: se evaluó rellenar OBSERVACIONES vacío con "Sin observaciones" a nivel de
+# pipeline, pero se revirtió — el vacío ya es un dato con significado que usa el propio
+# reporte (ej. % PEDIDOS PERFECTOS se basa en que esté en blanco). Si se necesita un
+# texto legible solo para una tabla puntual en Looker, se resuelve ahí con un campo
+# calculado (CASE WHEN OBSERVACIONES = "" THEN "Sin observaciones" ELSE OBSERVACIONES
+# END), no reescribiendo la fuente para todos los demás gráficos.
 
 # Perú no usa horario de verano, así que un offset fijo UTC-5 es exacto y, a diferencia de
 # usar tz="America/Lima", no depende de que el runner de GitHub Actions tenga la base de
@@ -159,20 +158,6 @@ def verificar_no_vacio(df: pd.DataFrame) -> None:
     if df.empty:
         log.error("La hoja origen no devolvió filas. Abortando para no subir un reporte vacío.")
         raise SystemExit(1)
-
-
-def rellenar_columnas_texto_vacias(df: pd.DataFrame, fila_es_pedido_real: pd.Series) -> pd.DataFrame:
-    for columna, texto_defecto in COLUMNAS_TEXTO_SIN_DATO.items():
-        if columna in df.columns:
-            # .strip() == "" cubre tanto NaN como celdas con solo espacios en blanco.
-            # Solo se rellena si además la fila es un pedido real (VENDEDOR presente):
-            # una fila de relleno del sistema (sin vendedor, sin pedido) no es "un pedido
-            # sin observaciones", es una fila vacía y debe quedar vacía.
-            vacio = df[columna].isna() | (df[columna].astype(str).str.strip() == "")
-            df.loc[vacio & fila_es_pedido_real, columna] = texto_defecto
-        else:
-            log.warning("Columna '%s' no encontrada; no se pudo rellenar su vacío.", columna)
-    return df
 
 
 # =====================================================================
@@ -583,7 +568,6 @@ def main():
         df["Tiempo_Total_min"] = time_diff_datetime(df, "FECHA", "Hora Reg.", "FECHA DE ENVIO", "Hora envio")
 
     df = agregar_columnas_auxiliares(df, ahora)
-    df = rellenar_columnas_texto_vacias(df, es_pedido_real(df))
 
     subir_a_google_sheets(df)
 
