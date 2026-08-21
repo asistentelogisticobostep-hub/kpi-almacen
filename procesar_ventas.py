@@ -317,7 +317,16 @@ def agregar_columnas_auxiliares(df: pd.DataFrame, ahora: pd.Timestamp) -> pd.Dat
         )
 
     # =================================================================
-    # Tiempo_Interno_Total_min: 3 ramas (ver notas al inicio del archivo)
+    # Tiempo_Interno_Total_min: ver notas al inicio del archivo.
+    #   - Rama 1: 6 tramos completos -> suma real.
+    #   - Rama 2: sin los 6 tramos pero Fin. Pack sí tiene dato -> Fin.Pack - Hora Reg. directo.
+    #   - Override de estatus: ESTATUS DEL PEDIDO = 'PROC. RMS' siempre cuenta como Cerrado,
+    #     aunque no haya timestamps suficientes para calcular un número (queda NA en ese caso,
+    #     pero no se sigue "cronometrando" como si estuviera abierto).
+    #   - Filas sin 'Hora Reg.' (filas de relleno sin ningún dato real): no se les asigna
+    #     estado ni se cronometran — quedan en blanco, porque la hora de registro es
+    #     nuestra base de tiempo y sin ella no hay nada que medir.
+    #   - El resto -> tiempo transcurrido hasta el momento de ejecución del script.
     # =================================================================
     columnas_los_6_tramos = columnas_proceso + columnas_espera
     tiene_6_tramos = all(col in df.columns for col in columnas_los_6_tramos)
@@ -327,60 +336,89 @@ def agregar_columnas_auxiliares(df: pd.DataFrame, ahora: pd.Timestamp) -> pd.Dat
     if tiene_hora_reg and (tiene_6_tramos or tiene_fin_pack):
         n = len(df)
         tiempo_interno = pd.Series([pd.NA] * n, index=df.index, dtype="object")
-        estado_pedido = pd.Series(["En proceso"] * n, index=df.index, dtype="object")
+
+        tiene_hora_reg_fila = df["Hora Reg."].notna()
 
         # Rama 1: los 6 tramos completos -> suma real (más precisa)
         if tiene_6_tramos:
             todos_presentes = df[columnas_los_6_tramos].notna().all(axis=1)
             suma_tramos = df[columnas_los_6_tramos].sum(axis=1, min_count=len(columnas_los_6_tramos))
             tiempo_interno = tiempo_interno.where(~todos_presentes, suma_tramos)
-            estado_pedido = estado_pedido.where(~todos_presentes, "Cerrado")
         else:
             todos_presentes = pd.Series([False] * n, index=df.index)
 
         # Rama 2: sin los 6 tramos, pero Fin. Pack sí tiene dato -> Fin.Pack - Hora Reg. directo
-        # (cubre, por ejemplo, pedidos antiguos cerrados manualmente al redondear al cierre de turno)
+        # (cubre, por ejemplo, pedidos antiguos cerrados manualmente al redondear al cierre de
+        # turno; rellenar Fin. Pack días después no afecta el cálculo, porque solo se usa la
+        # FECHA del pedido + la hora que se ingrese, no la fecha real de digitación)
         if tiene_fin_pack:
             fin_pack_directo = time_diff_datetime(df, "FECHA", "Hora Reg.", None, "Fin. Pack")
             usar_rama_2 = (~todos_presentes) & df["Fin. Pack"].notna() & fin_pack_directo.notna()
             tiempo_interno = tiempo_interno.where(~usar_rama_2, fin_pack_directo)
-            estado_pedido = estado_pedido.where(~usar_rama_2, "Cerrado")
         else:
             usar_rama_2 = pd.Series([False] * n, index=df.index)
 
-        # Rama 3: pedido sigue abierto -> tiempo transcurrido hasta el momento de ejecución
-        aun_abierto = ~(todos_presentes | usar_rama_2)
+        # Override: ESTATUS DEL PEDIDO = 'PROC. RMS' siempre es Cerrado para el negocio,
+        # tenga o no tenga tiempos calculables.
+        if "ESTATUS DEL PEDIDO" in df.columns:
+            estatus_proc_rms = df["ESTATUS DEL PEDIDO"] == "PROC. RMS"
+        else:
+            estatus_proc_rms = pd.Series([False] * n, index=df.index)
+
+        cerrado_mask = todos_presentes | usar_rama_2 | estatus_proc_rms
+
+        # Pedido sigue abierto -> tiempo transcurrido hasta el momento de ejecución.
+        # Solo aplica si hay Hora Reg. real (si no, no hay base de tiempo, queda en blanco).
+        aun_abierto = tiene_hora_reg_fila & ~cerrado_mask
         transcurrido = minutos_desde_hasta_ahora(df, "FECHA", "Hora Reg.", ahora)
         tiempo_interno = tiempo_interno.where(~aun_abierto, transcurrido)
-        # estado_pedido ya queda en "En proceso" por defecto para esta rama
+
+        # 'Cerrado' cubre tanto los casos con dato calculado (ramas 1/2) como el override de
+        # ESTATUS DEL PEDIDO = 'PROC. RMS' sin timestamps; 'En proceso' solo si hay Hora Reg.
+        # real y no está cerrado por ninguna vía; el resto (filas de relleno sin Hora Reg.
+        # y sin ser PROC. RMS) queda en blanco (pd.NA), sin estado ni cronómetro.
+        estado_pedido = pd.Series([pd.NA] * n, index=df.index, dtype="object")
+        estado_pedido = estado_pedido.where(~cerrado_mask, "Cerrado")
+        estado_pedido = estado_pedido.where(~aun_abierto, "En proceso")
 
         df["Tiempo_Interno_Total_min"] = pd.to_numeric(tiempo_interno, errors="coerce")
-        df["Pedido_Cerrado"] = estado_pedido  # "Cerrado" / "En proceso" — útil para filtrar promedios en Looker
+        df["Pedido_Cerrado"] = estado_pedido  # "Cerrado" / "En proceso" / NA (sin dato base) — filtro para Looker
 
     if "Tiempo_Interno_Total_min" in df.columns:
         tiempo_interno_num = pd.to_numeric(df["Tiempo_Interno_Total_min"], errors='coerce')
         df["Tiempo_Interno_Horas"] = (tiempo_interno_num / 60).round(2)
         df["Tiempo_Interno_Dias"] = (tiempo_interno_num / 1440).round(2)
 
-        cerrado = df.get("Pedido_Cerrado", pd.Series(["Cerrado"] * len(df), index=df.index)) == "Cerrado"
+        estado = df.get("Pedido_Cerrado", pd.Series(["Cerrado"] * len(df), index=df.index))
 
-        def clasificar_sla(en_cierre, valor):
-            if not en_cierre or pd.isna(valor):
+        def clasificar_sla(estado_fila, valor):
+            if pd.isna(estado_fila):
+                return pd.NA  # sin Hora Reg. (fila de relleno): no hay base para evaluar nada
+            if estado_fila == "En proceso":
                 return "En proceso"
+            # Cerrado: si no hay valor calculable (ej. PROC. RMS sin timestamps), no se juzga el SLA
+            if pd.isna(valor):
+                return pd.NA
             return "Cumple" if valor <= OBJETIVO_SLA_INTERNO_MIN else "No cumple"
 
         df["Cumple_SLA_Interno"] = [
-            clasificar_sla(c, v) for c, v in zip(cerrado, tiempo_interno_num)
+            clasificar_sla(e, v) for e, v in zip(estado, tiempo_interno_num)
         ]
 
-        # Percentil "pico" calculado SOLO sobre pedidos cerrados, para que los pedidos
-        # "En proceso" (incluidos los antiguos abandonados con tiempos enormes) no lo distorsionen.
-        valores_cerrados = tiempo_interno_num.where(cerrado)
+        # El umbral del percentil "pico" se calcula SOLO sobre pedidos cerrados, para que los
+        # pedidos "En proceso" (incluidos los antiguos abandonados con tiempos enormes) no lo
+        # distorsionen. Pero el resultado (Sí/No) se aplica a CUALQUIER pedido con tiempo
+        # calculable, esté cerrado o no — un pedido abierto que ya lleva un tiempo anómalo
+        # también debe saltar como "pico" para que se pueda revisar a tiempo.
+        valores_cerrados = tiempo_interno_num.where(estado == "Cerrado")
         p95_interno = valores_cerrados.quantile(0.95)
-        df["Pico_Tiempo_Interno"] = [
-            "No" if (not c or pd.isna(v)) else ("Sí" if v > p95_interno else "No")
-            for c, v in zip(cerrado, tiempo_interno_num)
-        ]
+
+        def clasificar_pico(valor):
+            if pd.isna(valor):
+                return pd.NA
+            return "Sí" if valor > p95_interno else "No"
+
+        df["Pico_Tiempo_Interno"] = tiempo_interno_num.apply(clasificar_pico)
 
     # --- KPI heredado (Tiempo_Total_min, de punta a punta hasta el envío) ---
     if "Tiempo_Total_min" in df.columns:
