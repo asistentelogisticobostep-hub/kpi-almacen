@@ -104,6 +104,12 @@ MAX_REINTENTOS_DESCARGA = 3
 ESPERA_ENTRE_REINTENTOS_SEG = 5
 TAMANO_LOTE_SUBIDA = 1000
 
+# "Dead man's switch": si se configura este secret (URL de un check de healthchecks.io
+# u otro servicio compatible), el script le avisa al terminar bien. Si el ping deja de
+# llegar dentro del plazo configurado en ese servicio, ÉL te avisa a ti — así te enteras
+# de una corrida colgada sin depender de revisar GitHub ni sus correos.
+HEALTHCHECK_PING_URL = os.environ.get("HEALTHCHECK_PING_URL", "").strip()
+
 # NOTA: se evaluó rellenar OBSERVACIONES vacío con "Sin observaciones" a nivel de
 # pipeline, pero se revirtió — el vacío ya es un dato con significado que usa el propio
 # reporte (ej. % PEDIDOS PERFECTOS se basa en que esté en blanco). Si se necesita un
@@ -524,6 +530,18 @@ def subir_a_google_sheets(df: pd.DataFrame) -> None:
 # =====================================================================
 # 8. FLUJO PRINCIPAL
 # =====================================================================
+def avisar_healthcheck(exito: bool) -> None:
+    """Notifica al servicio de monitoreo externo (si está configurado). Nunca lanza
+    error: un fallo al avisar no debe tumbar una corrida que sí funcionó."""
+    if not HEALTHCHECK_PING_URL:
+        return
+    url = HEALTHCHECK_PING_URL if exito else f"{HEALTHCHECK_PING_URL}/fail"
+    try:
+        requests.get(url, timeout=10)
+    except requests.exceptions.RequestException as exc:
+        log.warning("No se pudo notificar al servicio de monitoreo: %s", exc)
+
+
 def main():
     # Ojo: GitHub Actions corre en UTC, pero Hora Reg. está en hora de Perú (UTC-5, sin
     # horario de verano). Si no se ajusta, "ahora" queda ~5h adelantado y el tiempo
@@ -575,4 +593,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        # Los SystemExit(1) ya se loguearon en el punto donde ocurrieron (columnas
+        # faltantes, hoja vacía, error de descarga, etc.) — solo falta avisar y propagar
+        # el código de salida para que GitHub Actions marque la corrida como fallida.
+        avisar_healthcheck(exito=False)
+        raise
+    except Exception:
+        log.exception("Fallo inesperado en el pipeline.")
+        avisar_healthcheck(exito=False)
+        raise
+    else:
+        avisar_healthcheck(exito=True)
