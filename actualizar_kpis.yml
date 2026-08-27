@@ -1,29 +1,27 @@
 name: Actualizar KPIs de Almacén
-
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
-
 jobs:
   actualizar:
     runs-on: ubuntu-latest
     steps:
       - name: Descargar el código del repositorio
         uses: actions/checkout@v4
-
       - name: Preparar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Instalar librerías necesarias
         run: pip install -r requirements.txt
-
       - name: Ejecutar el script de KPIs
         env:
           SHEET_ID_ORIGINAL: ${{ secrets.SHEET_ID_ORIGINAL }}
           GID_ORIGINAL: ${{ secrets.GID_ORIGINAL }}
           SHEET_ID_DESTINO: ${{ secrets.SHEET_ID_DESTINO }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # Opcional: si no configuras este secret, el script simplemente no avisa a
+          # nadie (no rompe nada). Ver instrucciones para configurar el monitoreo.
+          HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
         run: python procesar_ventas.py
