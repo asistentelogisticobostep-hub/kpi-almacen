@@ -1,8 +1,8 @@
 name: Actualizar KPIs de Almacén
 on:
-  schedule:
-    - cron: "3,18,33,48 * * * *"
   workflow_dispatch: {}
+  schedule:
+    - cron: "17 */6 * * *"
 jobs:
   actualizar:
     runs-on: ubuntu-latest
@@ -21,7 +21,5 @@ jobs:
           GID_ORIGINAL: ${{ secrets.GID_ORIGINAL }}
           SHEET_ID_DESTINO: ${{ secrets.SHEET_ID_DESTINO }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          # Opcional: si no configuras este secret, el script simplemente no avisa a
-          # nadie (no rompe nada). Ver instrucciones para configurar el monitoreo.
           HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
         run: python procesar_ventas.py
