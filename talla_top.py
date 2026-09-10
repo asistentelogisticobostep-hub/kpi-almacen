@@ -236,6 +236,14 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
     filas = df.values.tolist()
     todas_las_filas = [encabezado] + filas
 
+    # Redimensionar la pestaña si hace falta (para que quepan todas las filas)
+    filas_necesarias = len(todas_las_filas) + 10  # margen de seguridad
+    filas_actuales = hoja.row_count
+    if filas_necesarias > filas_actuales:
+        log.info("Redimensionando pestaña de %d a %d filas...",
+                 filas_actuales, filas_necesarias)
+        hoja.resize(rows=filas_necesarias)
+
     # Subir por lotes
     total = len(todas_las_filas)
     for inicio in range(0, total, TAMANO_LOTE_SUBIDA):
