@@ -1,0 +1,29 @@
+name: Talla Top - KARDEX
+
+on:
+  repository_dispatch:
+    types: [talla-top]
+  workflow_dispatch: {}
+
+jobs:
+  talla_top:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar librerías necesarias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar script Talla Top
+        env:
+          SHEET_ID_KARDEX: ${{ secrets.SHEET_ID_KARDEX }}
+          GID_KARDEX: ${{ secrets.GID_KARDEX }}
+          SHEET_ID_DESTINO: ${{ secrets.SHEET_ID_DESTINO }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python talla_top.py
