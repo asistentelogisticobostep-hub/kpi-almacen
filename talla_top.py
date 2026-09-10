@@ -229,7 +229,7 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
     for inicio in range(0, total, TAMANO_LOTE_SUBIDA):
         lote = todas_las_filas[inicio : inicio + TAMANO_LOTE_SUBIDA]
         rango = f"A{inicio + 1}"
-        hoja.update(rango, lote)
+        hoja.update(values=lote, range_name=rango)
         log.info("Subidas filas %d a %d de %d.",
                  inicio + 1, min(inicio + TAMANO_LOTE_SUBIDA, total), total)
 
