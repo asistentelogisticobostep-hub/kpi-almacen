@@ -1,12 +1,12 @@
 """
 =====================================================================
- PIPELINE: KARDEX → Talla Top → Google Sheets → Looker Studio
+ PIPELINE: KARDEX → Talla Top (Top 3) → Google Sheets → Looker Studio
 =====================================================================
 
 Lee la hoja KARDEX (privada, vía API con Service Account), filtra
 movimientos de SALIDA con Nº de pedido que empiece con "T0", descompone
-el código de ITEM en CODIGO, MODELO y TALLA, y calcula la talla con
-mayor cantidad de salidas por CODIGO+MODELO+FECHA.
+el código de ITEM en CODIGO, MODELO y TALLA, y calcula las 3 tallas
+con mayor cantidad de salidas por CODIGO+MODELO+FECHA.
 
 El resultado se sube a la pestaña "Talla_Top" de la hoja destino.
 """
@@ -40,6 +40,7 @@ SHEET_ID_DESTINO = os.environ["SHEET_ID_DESTINO"]
 CREDENCIALES_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 NOMBRE_PESTANA_DESTINO = "Talla_Top"
+TOP_N = 3  # número de tallas top a mostrar por FECHA+CODIGO+MODELO
 
 ZONA_PERU = timezone(timedelta(hours=-5))
 
@@ -121,7 +122,7 @@ def descomponer_item(item: str) -> dict:
 
 def procesar(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Filtra, descompone ítems, agrupa y selecciona la talla top
+    Filtra, descompone ítems, agrupa y selecciona las TOP_N tallas
     por CODIGO+MODELO+FECHA.
     """
     # --- Normalizar nombres de columnas (quitar espacios extra) ---
@@ -153,7 +154,9 @@ def procesar(df: pd.DataFrame) -> pd.DataFrame:
 
     if df_filtrado.empty:
         log.warning("No hay registros que cumplan los filtros. Se subirá tabla vacía.")
-        return pd.DataFrame(columns=["FECHA", "CODIGO", "MODELO", "TALLA_TOP", "CANTIDAD_SALIDA"])
+        return pd.DataFrame(
+            columns=["FECHA", "CODIGO", "MODELO", "RANK", "TALLA_TOP", "CANTIDAD_SALIDA"]
+        )
 
     # --- Extraer solo la fecha (sin hora) en formato ISO ---
     df_filtrado["FECHA"] = (
@@ -177,13 +180,17 @@ def procesar(df: pd.DataFrame) -> pd.DataFrame:
         .sum()
     )
 
-    # --- Por cada FECHA + CODIGO + MODELO, quedarse con la talla top ---
-    agrupado = agrupado.sort_values("CANTIDAD", ascending=False)
-    talla_top = (
-        agrupado
-        .groupby(["FECHA", "CODIGO", "MODELO"], as_index=False)
-        .first()  # ya está ordenado desc → el primero es el top
+    # --- Ordenar por cantidad descendente y rankear dentro de cada grupo ---
+    agrupado = agrupado.sort_values(
+        ["FECHA", "CODIGO", "MODELO", "CANTIDAD"],
+        ascending=[True, True, True, False],
     )
+    agrupado["RANK"] = (
+        agrupado.groupby(["FECHA", "CODIGO", "MODELO"]).cumcount() + 1
+    )
+
+    # --- Quedarse solo con las TOP_N tallas ---
+    talla_top = agrupado[agrupado["RANK"] <= TOP_N].copy()
 
     # --- Renombrar y ordenar ---
     talla_top = talla_top.rename(columns={
@@ -191,12 +198,17 @@ def procesar(df: pd.DataFrame) -> pd.DataFrame:
         "CANTIDAD": "CANTIDAD_SALIDA",
     })
     talla_top = talla_top.sort_values(
-        "CANTIDAD_SALIDA", ascending=False
+        ["CANTIDAD_SALIDA"], ascending=False
     ).reset_index(drop=True)
 
-    log.info("Resultado final: %d filas (combinaciones únicas FECHA+CÓDIGO+MODELO).",
-             len(talla_top))
-    return talla_top[["FECHA", "CODIGO", "MODELO", "TALLA_TOP", "CANTIDAD_SALIDA"]]
+    # --- Reordenar columnas finales ---
+    talla_top = talla_top[
+        ["FECHA", "CODIGO", "MODELO", "RANK", "TALLA_TOP", "CANTIDAD_SALIDA"]
+    ]
+
+    log.info("Resultado final: %d filas (TOP %d por FECHA+CÓDIGO+MODELO).",
+             len(talla_top), TOP_N)
+    return talla_top
 
 
 # =====================================================================
@@ -232,8 +244,9 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
         hoja.update(values=lote, range_name=rango, value_input_option="USER_ENTERED")
         log.info("Subidas filas %d a %d de %d.",
                  inicio + 1, min(inicio + TAMANO_LOTE_SUBIDA, total), total)
+
     # Forzar formato visual dd/mm/yyyy en la columna A (FECHA)
-    # El valor real queda como fecha (filtrtable en Looker), solo se ve dd/mm/yyyy
+    # El valor real queda como fecha (filtrable en Looker), solo se ve dd/mm/yyyy
     hoja.format("A2:A", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}})
     log.info("Formato de fecha aplicado a la columna A.")
     log.info("✅ Subida completa: %d filas en pestaña '%s'.",
