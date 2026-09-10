@@ -155,10 +155,10 @@ def procesar(df: pd.DataFrame) -> pd.DataFrame:
         log.warning("No hay registros que cumplan los filtros. Se subirá tabla vacía.")
         return pd.DataFrame(columns=["FECHA", "CODIGO", "MODELO", "TALLA_TOP", "CANTIDAD_SALIDA"])
 
-    # --- Extraer solo la fecha (sin hora) ---
+    # --- Extraer solo la fecha (sin hora) en formato ISO ---
     df_filtrado["FECHA"] = (
         pd.to_datetime(df_filtrado[col_fecha_hora], dayfirst=True, errors="coerce")
-        .dt.strftime("%d/%m/%Y")
+        .dt.strftime("%Y-%m-%d")
     )
 
     # --- Cantidad numérica ---
@@ -229,10 +229,13 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
     for inicio in range(0, total, TAMANO_LOTE_SUBIDA):
         lote = todas_las_filas[inicio : inicio + TAMANO_LOTE_SUBIDA]
         rango = f"A{inicio + 1}"
-        hoja.update(values=lote, range_name=rango)
+        hoja.update(values=lote, range_name=rango, value_input_option="USER_ENTERED")
         log.info("Subidas filas %d a %d de %d.",
                  inicio + 1, min(inicio + TAMANO_LOTE_SUBIDA, total), total)
-
+    # Forzar formato visual dd/mm/yyyy en la columna A (FECHA)
+    # El valor real queda como fecha (filtrtable en Looker), solo se ve dd/mm/yyyy
+    hoja.format("A2:A", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}})
+    log.info("Formato de fecha aplicado a la columna A.")
     log.info("✅ Subida completa: %d filas en pestaña '%s'.",
              len(filas), NOMBRE_PESTANA_DESTINO)
 
