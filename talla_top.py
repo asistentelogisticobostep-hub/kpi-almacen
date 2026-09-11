@@ -1,14 +1,16 @@
 """
 =====================================================================
- PIPELINE: KARDEX → Talla Top (Top 3) → Google Sheets → Looker Studio
+ PIPELINE: KARDEX filtrado → Google Sheets → Looker Studio
 =====================================================================
 
-Lee la hoja KARDEX (privada, vía API con Service Account), filtra
-movimientos de SALIDA con Nº de pedido que empiece con "T0", descompone
-el código de ITEM en CODIGO, MODELO y TALLA, y calcula las 3 tallas
-con mayor cantidad de salidas por CODIGO+MODELO+FECHA.
+Lee la hoja KARDEX (privada, vía API con Service Account), aplica dos
+filtros sobre los datos originales y sube el resultado tal cual a la
+pestaña "Kardex_Filtrado" de la hoja destino (mismos encabezados y
+misma disposición de columnas que el KARDEX original).
 
-El resultado se sube a la pestaña "Talla_Top" de la hoja destino.
+Filtros:
+  1) TIPO_MOVIMIENTO == "SALIDA"        (columna B)
+  2) Nº PEDIDO empieza con "T0"          (columna H)
 """
 
 import json
@@ -29,7 +31,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("talla_top")
+log = logging.getLogger("kardex_filtrado")
 
 # =====================================================================
 # 1. CONFIGURACIÓN — desde variables de entorno (Secrets de GitHub)
@@ -39,8 +41,7 @@ GID_KARDEX = os.environ["GID_KARDEX"]
 SHEET_ID_DESTINO = os.environ["SHEET_ID_DESTINO"]
 CREDENCIALES_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-NOMBRE_PESTANA_DESTINO = "Talla_Top"
-TOP_N = 3  # número de tallas top a mostrar por FECHA+CODIGO+MODELO
+NOMBRE_PESTANA_DESTINO = "Kardex_Filtrado"
 
 ZONA_PERU = timezone(timedelta(hours=-5))
 
@@ -65,10 +66,16 @@ def autenticar() -> gspread.Client:
 
 
 # =====================================================================
-# 3. LECTURA DE LA HOJA KARDEX (vía API, porque es privada)
+# 3. LECTURA DE LA HOJA KARDEX
 # =====================================================================
-def leer_kardex(cliente: gspread.Client) -> pd.DataFrame:
-    """Lee todos los datos de la hoja KARDEX usando la API de Google Sheets."""
+def leer_kardex(cliente: gspread.Client):
+    """
+    Lee TODOS los valores de la hoja KARDEX (incluyendo encabezados)
+    usando la API de Google Sheets.
+
+    Devuelve (encabezado: list, filas: list[list]) con el layout
+    idéntico al de la hoja original.
+    """
     log.info("Abriendo hoja KARDEX...")
     libro = cliente.open_by_key(SHEET_ID_KARDEX)
 
@@ -80,7 +87,6 @@ def leer_kardex(cliente: gspread.Client) -> pd.DataFrame:
             break
 
     if hoja is None:
-        # Intentar por nombre como fallback
         try:
             hoja = libro.worksheet("KARDEX")
         except gspread.exceptions.WorksheetNotFound:
@@ -88,134 +94,60 @@ def leer_kardex(cliente: gspread.Client) -> pd.DataFrame:
             sys.exit(1)
 
     log.info("Leyendo hoja '%s' (gid=%s)...", hoja.title, hoja.id)
-    datos = hoja.get_all_records()
+    valores = hoja.get_all_values()  # incluye encabezado como primera fila
 
-    if not datos:
+    if not valores:
         log.error("La hoja KARDEX está vacía. Abortando.")
         sys.exit(1)
 
-    df = pd.DataFrame(datos)
-    log.info("KARDEX leída: %d filas, %d columnas.", len(df), len(df.columns))
-    return df
+    encabezado = valores[0]
+    filas = valores[1:]
+    log.info("KARDEX leída: %d filas de datos, %d columnas.",
+             len(filas), len(encabezado))
+    return encabezado, filas
 
 
 # =====================================================================
-# 4. PROCESAMIENTO
+# 4. PROCESAMIENTO — solo filtros, sin transformar layout
 # =====================================================================
-def descomponer_item(item: str) -> dict:
+def filtrar(filas: list) -> list:
     """
-    Descompone un código de ITEM en CODIGO, MODELO y TALLA.
+    Aplica los dos filtros sobre las filas crudas del KARDEX
+    (listas de strings) SIN alterar el layout de columnas.
 
-    Ejemplo: '454M442' → CODIGO='454', MODELO='M4', TALLA='42'
-    Regla: últimos 2 = TALLA, 2 anteriores = MODELO, resto = CODIGO.
-    El largo del ítem puede variar, pero la lógica es la misma.
+    Filtros:
+      - columna B (índice 1): TIPO_MOVIMIENTO == "SALIDA"
+      - columna H (índice 7): Nº PEDIDO empieza con "T0"
+
+    Devuelve la lista de filas que cumplen ambas condiciones.
     """
-    item = str(item).strip()
-    if len(item) < 4:
-        return {"CODIGO": item, "MODELO": "", "TALLA": ""}
-    return {
-        "CODIGO": item[:-4],
-        "MODELO": item[-4:-2],
-        "TALLA": item[-2:],
-    }
+    idx_movimiento = 1   # B
+    idx_pedido = 7       # H
 
+    resultado = []
+    for fila in filas:
+        # Asegurar longitud mínima por si alguna fila viene incompleta
+        if len(fila) <= max(idx_movimiento, idx_pedido):
+            continue
 
-def procesar(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filtra, descompone ítems, agrupa y selecciona las TOP_N tallas
-    por CODIGO+MODELO+FECHA.
-    """
-    # --- Normalizar nombres de columnas (quitar espacios extra) ---
-    df.columns = df.columns.str.strip()
+        movimiento = str(fila[idx_movimiento]).strip().upper()
+        pedido = str(fila[idx_pedido]).strip().upper()
 
-    # --- Identificar columnas por posición (como en la hoja KARDEX) ---
-    # Columna A = FECHA_HORA, B = TIPO_MOVIMIENTO, E = ITEM,
-    # F = CANTIDAD, H = Nº PEDIDO
-    col_fecha_hora = df.columns[0]   # A
-    col_movimiento = df.columns[1]   # B
-    col_item = df.columns[4]         # E
-    col_cantidad = df.columns[5]     # F
-    col_pedido = df.columns[7]       # H
+        if movimiento == "SALIDA" and pedido.startswith("T0"):
+            resultado.append(fila)
 
-    log.info("Columnas detectadas → FechaHora: '%s', Movimiento: '%s', "
-             "Item: '%s', Cantidad: '%s', Pedido: '%s'",
-             col_fecha_hora, col_movimiento, col_item, col_cantidad, col_pedido)
-
-    # --- Filtro 1: Solo SALIDA ---
-    mascara_salida = df[col_movimiento].astype(str).str.strip().str.upper() == "SALIDA"
-    log.info("Filas con SALIDA: %d de %d", mascara_salida.sum(), len(df))
-
-    # --- Filtro 2: Nº PEDIDO empieza con T0 ---
-    mascara_t0 = df[col_pedido].astype(str).str.strip().str.upper().str.startswith("T0")
-    log.info("Filas con pedido T0: %d de %d", mascara_t0.sum(), len(df))
-
-    df_filtrado = df[mascara_salida & mascara_t0].copy()
-    log.info("Filas tras ambos filtros: %d", len(df_filtrado))
-
-    if df_filtrado.empty:
-        log.warning("No hay registros que cumplan los filtros. Se subirá tabla vacía.")
-        return pd.DataFrame(
-            columns=["FECHA", "CODIGO", "MODELO", "RANK", "TALLA_TOP", "CANTIDAD_SALIDA"]
-        )
-
-    # --- Extraer solo la fecha (sin hora) en formato ISO ---
-    df_filtrado["FECHA"] = (
-        pd.to_datetime(df_filtrado[col_fecha_hora], dayfirst=True, errors="coerce")
-        .dt.strftime("%Y-%m-%d")
-    )
-
-    # --- Cantidad numérica ---
-    df_filtrado["CANTIDAD"] = pd.to_numeric(
-        df_filtrado[col_cantidad], errors="coerce"
-    ).fillna(0).astype(int)
-
-    # --- Descomponer ITEM en CODIGO, MODELO, TALLA ---
-    descompuesto = df_filtrado[col_item].apply(descomponer_item).apply(pd.Series)
-    df_filtrado = pd.concat([df_filtrado, descompuesto], axis=1)
-
-    # --- Agrupar por FECHA + CODIGO + MODELO + TALLA → sumar CANTIDAD ---
-    agrupado = (
-        df_filtrado
-        .groupby(["FECHA", "CODIGO", "MODELO", "TALLA"], as_index=False)["CANTIDAD"]
-        .sum()
-    )
-
-    # --- Ordenar por cantidad descendente y rankear dentro de cada grupo ---
-    agrupado = agrupado.sort_values(
-        ["FECHA", "CODIGO", "MODELO", "CANTIDAD"],
-        ascending=[True, True, True, False],
-    )
-    agrupado["RANK"] = (
-        agrupado.groupby(["FECHA", "CODIGO", "MODELO"]).cumcount() + 1
-    )
-
-    # --- Quedarse solo con las TOP_N tallas ---
-    talla_top = agrupado[agrupado["RANK"] <= TOP_N].copy()
-
-    # --- Renombrar y ordenar ---
-    talla_top = talla_top.rename(columns={
-        "TALLA": "TALLA_TOP",
-        "CANTIDAD": "CANTIDAD_SALIDA",
-    })
-    talla_top = talla_top.sort_values(
-        ["CANTIDAD_SALIDA"], ascending=False
-    ).reset_index(drop=True)
-
-    # --- Reordenar columnas finales ---
-    talla_top = talla_top[
-        ["FECHA", "CODIGO", "MODELO", "RANK", "TALLA_TOP", "CANTIDAD_SALIDA"]
-    ]
-
-    log.info("Resultado final: %d filas (TOP %d por FECHA+CÓDIGO+MODELO).",
-             len(talla_top), TOP_N)
-    return talla_top
+    log.info("Filas tras filtros (SALIDA + T0): %d de %d",
+             len(resultado), len(filas))
+    return resultado
 
 
 # =====================================================================
 # 5. SUBIDA A GOOGLE SHEETS
 # =====================================================================
-def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
-    """Sube el DataFrame a la pestaña Talla_Top de la hoja destino."""
+def subir_a_sheets(cliente: gspread.Client,
+                   encabezado: list,
+                   filas: list) -> None:
+    """Sube encabezado + filas filtradas a la pestaña destino."""
     log.info("Abriendo hoja destino...")
     libro = cliente.open_by_key(SHEET_ID_DESTINO)
 
@@ -228,16 +160,14 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
     except gspread.exceptions.WorksheetNotFound:
         log.info("Creando pestaña '%s'...", NOMBRE_PESTANA_DESTINO)
         hoja = libro.add_worksheet(
-            title=NOMBRE_PESTANA_DESTINO, rows=1000, cols=10
+            title=NOMBRE_PESTANA_DESTINO, rows=1000, cols=max(10, len(encabezado))
         )
 
-    # Preparar datos: encabezado + filas
-    encabezado = df.columns.tolist()
-    filas = df.values.tolist()
+    # Estructura final: [encabezado] + filas
     todas_las_filas = [encabezado] + filas
 
-    # Redimensionar la pestaña si hace falta (para que quepan todas las filas)
-    filas_necesarias = len(todas_las_filas) + 10  # margen de seguridad
+    # Redimensionar si hace falta
+    filas_necesarias = len(todas_las_filas) + 10
     filas_actuales = hoja.row_count
     if filas_necesarias > filas_actuales:
         log.info("Redimensionando pestaña de %d a %d filas...",
@@ -247,16 +177,12 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
     # Subir por lotes
     total = len(todas_las_filas)
     for inicio in range(0, total, TAMANO_LOTE_SUBIDA):
-        lote = todas_las_filas[inicio : inicio + TAMANO_LOTE_SUBIDA]
+        lote = todas_las_filas[inicio: inicio + TAMANO_LOTE_SUBIDA]
         rango = f"A{inicio + 1}"
         hoja.update(values=lote, range_name=rango, value_input_option="USER_ENTERED")
         log.info("Subidas filas %d a %d de %d.",
                  inicio + 1, min(inicio + TAMANO_LOTE_SUBIDA, total), total)
 
-    # Forzar formato visual dd/mm/yyyy en la columna A (FECHA)
-    # El valor real queda como fecha (filtrable en Looker), solo se ve dd/mm/yyyy
-    hoja.format("A2:A", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}})
-    log.info("Formato de fecha aplicado a la columna A.")
     log.info("✅ Subida completa: %d filas en pestaña '%s'.",
              len(filas), NOMBRE_PESTANA_DESTINO)
 
@@ -266,16 +192,16 @@ def subir_a_sheets(cliente: gspread.Client, df: pd.DataFrame) -> None:
 # =====================================================================
 def main():
     log.info("=" * 60)
-    log.info("INICIO: Pipeline Talla Top desde KARDEX")
+    log.info("INICIO: Pipeline KARDEX filtrado")
     log.info("=" * 60)
 
     cliente = autenticar()
-    df_kardex = leer_kardex(cliente)
-    df_resultado = procesar(df_kardex)
-    subir_a_sheets(cliente, df_resultado)
+    encabezado, filas = leer_kardex(cliente)
+    filas_filtradas = filtrar(filas)
+    subir_a_sheets(cliente, encabezado, filas_filtradas)
 
     log.info("=" * 60)
-    log.info("FIN: Pipeline Talla Top completado exitosamente")
+    log.info("FIN: Pipeline completado exitosamente")
     log.info("=" * 60)
 
 
