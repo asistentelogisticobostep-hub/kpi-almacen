@@ -25,15 +25,24 @@ CAMBIOS EN ESTA VERSIÓN (acordados en revisión de datos):
          directo.
       3) Si el pedido sigue abierto -> tiempo transcurrido = ahora (momento de ejecución
          del script) - Hora Reg. Nunca queda en 0 ni en blanco mientras está en proceso.
-  - Cumple_SLA_Interno pasa de 2 a 3 estados: 'Cumple' / 'No cumple' / 'En proceso'.
-  - Pico_Tiempo_Interno y Pico_Tiempo_Total se calculan SOLO sobre pedidos cerrados
-    (Cumple/No cumple), para que los pedidos "En proceso" (incluidos los antiguos
-    abandonados) no distorsionen el percentil.
+    Además, ESTATUS DEL PEDIDO = 'PROC. RMS' siempre cuenta como Cerrado, y las filas sin
+    'Hora Reg.' (relleno) no se cronometran. El estado vive en la columna Pedido_Cerrado
+    ('Cerrado' / 'En proceso' / en blanco).
+  - Cumple_SLA_Interno tiene 2 estados: 'Cumple' / 'No cumple'. Es un umbral puro sobre
+    Tiempo_Interno_Total_min (también aplica a pedidos en proceso); sin valor calculable
+    queda en blanco. El filtro abierto/cerrado se hace con Pedido_Cerrado.
+  - Pico_Tiempo_Interno se calcula sobre todos los pedidos con tiempo calculable (cerrados
+    + en proceso) y Pico_Tiempo_Total sobre todos los que tienen Tiempo_Total_min; ambos con
+    percentil 0.95.
   - NO se cambia el parseo de fechas (se mantiene formato fijo %d/%m/%Y).
   - NO se vectoriza el código por ahora.
   - NO se toca la lógica de time_diff_datetime para los 6 tramos individuales: el bug de
     medianoche en esos tramos se corrige en la fuente (alerta visual al digitador), no
     en el script.
+  - NUEVO (fix APIError 400 "exceeds grid limits"): subir_a_google_sheets ahora revisa el
+    tamaño de la pestaña destino y la agranda (filas/columnas) antes de escribir si los
+    datos ya no caben. La pestaña, si no existe, se crea directamente con el tamaño
+    necesario (antes nacía de 1x1).
 """
 
 import json
@@ -489,10 +498,30 @@ def subir_a_google_sheets(df: pd.DataFrame) -> None:
                    "esté compartida con: %s", creds.service_account_email)
         raise SystemExit(1)
 
+    filas_necesarias = len(df) + 1  # +1 por el encabezado
+    columnas_necesarias = len(df.columns)
+
     try:
         hoja = spreadsheet.worksheet(NOMBRE_PESTAÑA_DESTINO)
     except gspread.exceptions.WorksheetNotFound:
-        hoja = spreadsheet.add_worksheet(title=NOMBRE_PESTAÑA_DESTINO, rows=1, cols=1)
+        # Si no existe, se crea ya con el tamaño que necesitamos (antes nacía de 1x1)
+        log.info("La hoja '%s' no existe. Creándola...", NOMBRE_PESTAÑA_DESTINO)
+        hoja = spreadsheet.add_worksheet(
+            title=NOMBRE_PESTAÑA_DESTINO,
+            rows=filas_necesarias,
+            cols=columnas_necesarias,
+        )
+
+    # Fix APIError 400 ("exceeds grid limits"): la API de Sheets NO agranda la cuadrícula
+    # al escribir con update(); si los datos crecieron más allá de filas/columnas de la
+    # pestaña, hay que redimensionarla antes. Solo se agranda, nunca se achica.
+    if hoja.row_count < filas_necesarias or hoja.col_count < columnas_necesarias:
+        nuevas_filas = max(filas_necesarias, hoja.row_count)
+        nuevas_cols = max(columnas_necesarias, hoja.col_count)
+        log.info("Redimensionando hoja '%s' de %dx%d a %dx%d...",
+                 NOMBRE_PESTAÑA_DESTINO, hoja.row_count, hoja.col_count,
+                 nuevas_filas, nuevas_cols)
+        hoja.resize(rows=nuevas_filas, cols=nuevas_cols)
 
     log.info("Limpiando datos de la hoja destino...")
     hoja.clear()
@@ -595,7 +624,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit as exc:
+    except SystemExit:
         # Los SystemExit(1) ya se loguearon en el punto donde ocurrieron (columnas
         # faltantes, hoja vacía, error de descarga, etc.) — solo falta avisar y propagar
         # el código de salida para que GitHub Actions marque la corrida como fallida.
