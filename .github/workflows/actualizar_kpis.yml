@@ -5,6 +5,11 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
+# ESTO ES CLAVE: Evita que dos ejecuciones se pisen entre sí
+concurrency:
+  group: actualizar-kpis-almacen
+  cancel-in-progress: false
+
 jobs:
   actualizar:
     runs-on: ubuntu-latest
@@ -26,4 +31,6 @@ jobs:
           GID_ORIGINAL: ${{ secrets.GID_ORIGINAL }}
           SHEET_ID_DESTINO: ${{ secrets.SHEET_ID_DESTINO }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # Agregado para que el script pueda avisar si falla (si lo configuraste)
+          HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
         run: python procesar_ventas.py
